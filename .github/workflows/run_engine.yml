@@ -1,0 +1,36 @@
+name: Run 9PM VPA Forensic Engine
+
+on:
+  schedule:
+    # 每周一至周五 UTC 13:00 (即马来西亚时间 21:00 / 9:00 PM) 自动运行
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch: # 支持随时在网页上手动点击一键运行测试
+
+jobs:
+  run-vpa-engine:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装依赖包
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 运行量价法医引擎
+        run: |
+          python vpa_forensic_engine.py
+
+      - name: 保存 Excel 战役数据表
+        uses: actions/upload-artifact@v4
+        with:
+          name: QQQ_VPA_Forensic_Excel
+          path: "*.xlsx"
+          retention-days: 7
