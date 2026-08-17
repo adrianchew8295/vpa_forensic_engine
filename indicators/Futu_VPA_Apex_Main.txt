@@ -1,0 +1,106 @@
+{ ========================================================== }
+{ VPA MAIN APEX - GEM QUANT RESONANCE (CLEAN EDITION)        }
+{ 富途牛牛 / Moomoo 主图量价共振指标                          }
+{ ========================================================== }
+
+{ ---------------------------------------------------------- }
+{ 1. 每日 9:00 PM 战役坐标注入区                             }
+{ ---------------------------------------------------------- }
+RES_4H  := 748.65;   { 4H 宏观阻力天花板 }
+PMH_VAL := 736.42;   { 盘前最高价 PMH }
+POC_VAL := 732.65;   { 盘前主力公允成本重心 POC 🎯 }
+PML_VAL := 728.88;   { 盘前多头生命线 PML }
+SUP_4H  := 661.14;   { 4H 宏观铁底支撑 }
+
+{ ---------------------------------------------------------- }
+{ 2. 战役坐标画线渲染                                        }
+{ ---------------------------------------------------------- }
+RES_LINE: RES_4H,  COLORRED,    LINETHICK2;  { 红色实线: 4H 阻力 }
+PMH_LINE: PMH_VAL, COLORMAGENTA,DOTLINE;      { 粉色虚线: 盘前最高 }
+POC_LINE: POC_VAL, COLORYELLOW, LINETHICK2;  { 金色实线: 主力 POC 🎯 }
+PML_LINE: PML_VAL, COLORCYAN,   DOTLINE;      { 青色虚线: 多头生命线 }
+SUP_LINE: SUP_4H,  COLORGREEN,  LINETHICK2;  { 绿色实线: 4H 铁底 }
+
+{ ---------------------------------------------------------- }
+{ 3. 基础均线与成交量阶梯                                    }
+{ ---------------------------------------------------------- }
+MY_VWAP := MA(CLOSE, 20);
+VWAP_LINE: MY_VWAP, COLORWHITE, LINETHICK1;
+
+VMA20   := MA(VOL, 20);
+VOL_06X := VOL <= (VMA20 * 0.65);                          { 窒息地量 }
+VOL_14X := (VOL >= VMA20 * 1.4) AND (VOL < VMA20 * 2.0);  { 猎手量 }
+VOL_20X := VOL >= (VMA20 * 2.0);                          { 刺客巨量 }
+
+{ ---------------------------------------------------------- }
+{ 4. K 线实体与影线解构                                      }
+{ ---------------------------------------------------------- }
+K_LEN     := IF(HIGH = LOW, 0.001, HIGH - LOW);
+K_AVG_LEN := MA(K_LEN, 20);
+
+BODY       := ABS(CLOSE - OPEN);
+LOWER_WICK := MIN(CLOSE, OPEN) - LOW;
+UPPER_WICK := HIGH - MAX(CLOSE, OPEN);
+
+L_WICK_PCT := LOWER_WICK / K_LEN;
+U_WICK_PCT := UPPER_WICK / K_LEN;
+BODY_PCT   := BODY / K_LEN;
+
+{ ---------------------------------------------------------- }
+{ 5. 核心量价形态判定                                        }
+{ ---------------------------------------------------------- }
+{ A. 底部多头吸收 }
+EFFORT_ABSORB   := (VOL >= REF(VOL, 1) OR VOL >= VMA20 * 1.4) AND (L_WICK_PCT >= 0.35) AND (CLOSE >= LOW + K_LEN * 0.55);
+IS_STOPPING_BUY := EFFORT_ABSORB AND (LOWER_WICK > UPPER_WICK * 1.3);
+
+{ B. 顺势放量主升突破 }
+IS_BULL_BAR   := (CLOSE > OPEN) AND (BODY_PCT >= 0.50) AND (CLOSE >= HIGH - K_LEN * 0.25);
+MARKUP_TREND  := (CLOSE > POC_VAL) AND (VOL >= VMA20 * 1.4) AND (K_LEN >= K_AVG_LEN * 1.1);
+IS_MARKUP_BUY := IS_BULL_BAR AND (CROSS(CLOSE, POC_VAL) OR CROSS(CLOSE, PMH_VAL) OR MARKUP_TREND);
+
+{ C. 顶部派发见顶 }
+EFFORT_TOPPING  := (VOL >= REF(VOL, 1) OR VOL >= VMA20 * 1.4) AND (U_WICK_PCT >= 0.38) AND (CLOSE <= LOW + K_LEN * 0.45);
+IS_TOPPING_SELL := EFFORT_TOPPING AND (UPPER_WICK > LOWER_WICK * 1.5);
+
+{ D. 放量破位 }
+IS_BEAR_BAR       := (CLOSE < OPEN) AND (BODY_PCT >= 0.50) AND (CLOSE <= LOW + K_LEN * 0.25);
+IS_BREAKDOWN_SELL := IS_BEAR_BAR AND (VOL >= VMA20 * 1.4) AND (CROSS(PML_VAL, CLOSE) OR CROSS(POC_VAL, CLOSE));
+
+{ ---------------------------------------------------------- }
+{ 6. 关键防区过滤与去重 (FILTER 防拥挤)                      }
+{ ---------------------------------------------------------- }
+ZONE_TOL := 0.003;
+NEAR_POC := ABS(CLOSE - POC_VAL) / POC_VAL <= ZONE_TOL;
+NEAR_PML := ABS(CLOSE - PML_VAL) / PML_VAL <= ZONE_TOL;
+NEAR_RES := ABS(CLOSE - RES_4H)  / RES_4H  <= ZONE_TOL;
+NEAR_PMH := ABS(CLOSE - PMH_VAL) / PMH_VAL <= ZONE_TOL;
+
+RAW_TEST_BUY  := VOL_06X AND (K_LEN <= K_AVG_LEN * 0.70) AND (NEAR_POC OR NEAR_PML);
+RAW_TEST_SELL := VOL_06X AND (K_LEN <= K_AVG_LEN * 0.70) AND (NEAR_RES OR NEAR_PMH);
+RAW_HUNTER_C  := VOL_14X AND (IS_STOPPING_BUY OR IS_MARKUP_BUY) AND (NEAR_POC OR NEAR_PML OR CLOSE > POC_VAL);
+RAW_HUNTER_P  := VOL_14X AND (IS_TOPPING_SELL OR IS_BREAKDOWN_SELL) AND (NEAR_RES OR NEAR_PMH OR CLOSE < POC_VAL);
+RAW_ASSA_C    := VOL_20X AND (IS_STOPPING_BUY OR IS_MARKUP_BUY);
+RAW_ASSA_P    := VOL_20X AND (IS_TOPPING_SELL OR IS_BREAKDOWN_SELL);
+
+{ ---------------------------------------------------------- }
+{ 7. 3 周期防重叠打标 (3-BAR CLEAN VISUALS)                  }
+{ ---------------------------------------------------------- }
+TEST_BUY    := FILTER(RAW_TEST_BUY, 3);
+TEST_SELL   := FILTER(RAW_TEST_SELL, 3);
+HUNTER_CALL := FILTER(RAW_HUNTER_C, 3);
+HUNTER_PUT  := FILTER(RAW_HUNTER_P, 3);
+ASSASSIN_C  := FILTER(RAW_ASSA_C, 3);
+ASSASSIN_P  := FILTER(RAW_ASSA_P, 3);
+
+DRAWTEXT(TEST_BUY,    LOW * 0.9995, '🚀TEST'), COLORYELLOW;
+DRAWTEXT(TEST_SELL,   HIGH * 1.0005, '🛑TEST'), COLORGRAY;
+DRAWTEXT(HUNTER_CALL, LOW * 0.9990, '▲CALL'), COLORCYAN;
+DRAWTEXT(HUNTER_PUT,  HIGH * 1.0010, '▼PUT'),  COLORRED;
+DRAWTEXT(ASSASSIN_C,  LOW * 0.9985, '★BUY_APEX'), COLORGREEN;
+DRAWTEXT(ASSASSIN_P,  HIGH * 1.0015, '★VETO_EXIT'), COLORRED;
+
+{ ---------------------------------------------------------- }
+{ 8. 回测系统信号输出 (BACKTEST READY)                       }
+{ ---------------------------------------------------------- }
+BUY_SIGNAL:  IF(ASSASSIN_C OR HUNTER_CALL OR TEST_BUY, 1, 0), NODRAW;
+SELL_SIGNAL: IF(ASSASSIN_P OR HUNTER_PUT  OR TEST_SELL, 1, 0), NODRAW;
