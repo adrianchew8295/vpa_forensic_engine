@@ -4,16 +4,18 @@ import requests
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-import pytz
 
 # ==============================================================================
 # 0. 核心配置与资产监控池 (CONFIG & 12-TICKER BASKET)
 # ==============================================================================
 TIINGO_API_KEY = "bcffe3a5cf7eeef085e405cfa4a3e5691b976217"
 
+# 你的专属 Google Sheets Web App 接口
+GOOGLE_SHEET_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbyXUmasuhybt_QpF3_-Z-ILBKr8eeEBvbq7Be1FzOXpi_GhpwSfQTvmOO8u1H97YwvYZg/exec"
+
 TARGET_INDEX = "QQQ"
 MAG_7 = ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA"]
-MEMORY_BASKET = ["MU", "SNDK", "WDC", "STX"]  # SNDK 与 WDC 独立审计
+MEMORY_BASKET = ["MU", "SNDK", "WDC", "STX"]  # 存储与闪存 4 神经独立审计
 ALL_TICKERS = [TARGET_INDEX] + MAG_7 + MEMORY_BASKET
 
 HEADERS = {
@@ -99,8 +101,9 @@ def calculate_volume_profile(df_intraday, price_col='close', vol_col='volume', b
 # ==============================================================================
 # 2. Tiingo API 数据提取管道 (REAL-TIME & INTRADAY)
 # ==============================================================================
-def fetch_tiingo_daily(ticker, days=120):
-    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+def fetch_tiingo_daily(ticker, days=252):
+    """获取 252 交易日（1 年）数据以保证 52 周最高点精度"""
+    start_date = (datetime.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
     url = f"https://api.tiingo.com/tiingo/daily/{ticker}/prices?startDate={start_date}&token={TIINGO_API_KEY}"
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
@@ -142,19 +145,73 @@ def fetch_tiingo_intraday_premarket(ticker):
     return pd.DataFrame()
 
 # ==============================================================================
-# 3. 核心计算与数据聚合 (PIPELINE AGGREGATION)
+# 3. Google Sheets 自动化推送模块 (AUTO CLOUD SYNC)
+# ==============================================================================
+def push_to_google_sheets(df_qqq, df_breadth, df_dip, bias, mag7_ratio, mem_pulse):
+    if not GOOGLE_SHEET_WEB_APP_URL:
+        print("[-] 未配置 Google Sheet Web App URL，跳过云端同步。")
+        return
+
+    print("\n⏳ 正在自动同步数据至 Google Sheets...")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    qqq_row = df_qqq.iloc[0].to_dict()
+
+    # 1. Today_War_Room 载荷
+    war_room_headers = [
+        "Date", "Symbol", "HTF_Bias", "4H_Major_Res", "PMH", 
+        "Premarket_POC", "PML", "4H_Major_Sup", "Hard_SL", "No_Trade_Zone", "Live_Price"
+    ]
+    war_room_row = [
+        today_str, "QQQ", bias, qqq_row["4H_Major_Res"], qqq_row["PMH"],
+        qqq_row["Premarket_POC"], qqq_row["PML"], qqq_row["4H_Major_Sup"],
+        qqq_row["Hard_SL"], qqq_row["No_Trade_Zone"], qqq_row["Last_Premarket_Price"]
+    ]
+
+    # 2. Daily_History 追加行载荷
+    history_row = [
+        today_str, "QQQ", bias, qqq_row["Premarket_POC"], qqq_row["PMH"],
+        qqq_row["PML"], qqq_row["4H_Major_Res"], qqq_row["4H_Major_Sup"],
+        mag7_ratio, mem_pulse
+    ]
+
+    # 3. Market_Breadth_12 载荷
+    breadth_headers = list(df_breadth.columns)
+    breadth_rows = df_breadth.values.tolist()
+
+    # 4. Dip_To_Swing_20pct 载荷
+    dip_headers = list(df_dip.columns)
+    dip_rows = df_dip.values.tolist()
+
+    payload = {
+        "war_room": {"headers": war_room_headers, "row": war_room_row},
+        "history_row": history_row,
+        "breadth": {"headers": breadth_headers, "rows": breadth_rows},
+        "dip_pool": {"headers": dip_headers, "rows": dip_rows}
+    }
+
+    try:
+        res = requests.post(GOOGLE_SHEET_WEB_APP_URL, json=payload, timeout=15)
+        if res.status_code == 200 and "SUCCESS" in res.text:
+            print("🚀 Google Sheets 4 大工作表已全部全自动同步更新！")
+        else:
+            print(f"[-] Google Sheet 同步响应异常: {res.text}")
+    except Exception as e:
+        print(f"[-] Google Sheet 同步请求失败: {e}")
+
+# ==============================================================================
+# 4. 核心计算与数据聚合 (PIPELINE AGGREGATION)
 # ==============================================================================
 def generate_9pm_report():
     print("[*] 正在启动 9:00 PM 实时量价法医计算引擎...")
     
     # 1. QQQ 宏观与真实盘前计算
-    qqq_daily = fetch_tiingo_daily(TARGET_INDEX, days=90)
+    qqq_daily = fetch_tiingo_daily(TARGET_INDEX, days=252)
     qqq_intra = fetch_tiingo_intraday_premarket(TARGET_INDEX)
     qqq_quote = fetch_tiingo_realtime_quote(TARGET_INDEX)
     
     # 宏观价格
     res_4h = round(qqq_daily['high'].max(), 2) if not qqq_daily.empty else 745.45
-    sup_4h = round(qqq_daily['low'].tail(20).min(), 2) if not qqq_daily.empty else 661.14
+    sup_4h = round(qqq_daily['low'].tail(30).min(), 2) if not qqq_daily.empty else 661.14
     yesterday_close = round(qqq_daily['close'].iloc[-1], 2) if not qqq_daily.empty else 732.07
     
     # 实时盘前真实价格
@@ -166,12 +223,15 @@ def generate_9pm_report():
         pml = round(qqq_intra['low'].min(), 2)
         poc, vah, val = calculate_volume_profile(qqq_intra)
     else:
-        # 无盘前分时时，以实时价格和昨日收盘动态映射，杜绝固定伪数值
         pmh = round(max(live_price, yesterday_close) * 1.003, 2)
         pml = round(min(live_price, yesterday_close) * 0.997, 2)
         poc = round((pmh + pml) / 2.0, 2)
         vah = pmh
         val = pml
+
+    # 条件框架衍生指标
+    hard_sl = round(pml * 0.997, 2)
+    no_trade_zone = f"{round(pml + (poc - pml)*0.3, 2)} - {round(poc + (pmh - poc)*0.3, 2)}"
 
     df_qqq_summary = pd.DataFrame([{
         "Ticker": "QQQ",
@@ -182,6 +242,8 @@ def generate_9pm_report():
         "Premarket_POC": poc,
         "VAH": vah,
         "VAL": val,
+        "Hard_SL": hard_sl,
+        "No_Trade_Zone": no_trade_zone,
         "Yesterday_Close": yesterday_close,
         "Last_Premarket_Price": live_price,
         "Status": "ABOVE_POC" if live_price >= poc else "BELOW_POC"
@@ -190,9 +252,11 @@ def generate_9pm_report():
     # 2. 12 标的宽度与 -20% 折扣监控
     breadth_rows = []
     dip_rows = []
+    mag7_bullish_count = 0
+    memory_bullish_count = 0
     
     for ticker in ALL_TICKERS:
-        daily_df = fetch_tiingo_daily(ticker, days=180)
+        daily_df = fetch_tiingo_daily(ticker, days=252)
         intra_df = fetch_tiingo_intraday_premarket(ticker)
         quote = fetch_tiingo_realtime_quote(ticker)
         
@@ -207,8 +271,12 @@ def generate_9pm_report():
             group = "INDEX"
         elif ticker in MAG_7:
             group = "MAG_7"
+            if curr_price >= last_close:
+                mag7_bullish_count += 1
         else:
             group = "MEMORY_FLASH"
+            if curr_price >= last_close:
+                memory_bullish_count += 1
             
         vpa_sig = "NORMAL"
         rvol = 1.0
@@ -253,7 +321,15 @@ def generate_9pm_report():
     df_breadth = pd.DataFrame(breadth_rows)
     df_dip = pd.DataFrame(dip_rows)
 
-    # 3. 输出多 Tab 结构化 Excel
+    # 判定全局大势与脉搏
+    htf_bias = "BULLISH" if live_price >= poc and mag7_bullish_count >= 4 else "RANGE_BALANCE"
+    if live_price < poc and mag7_bullish_count <= 2:
+        htf_bias = "BEARISH"
+    
+    mag7_ratio_str = f"{mag7_bullish_count}/7"
+    mem_pulse_str = "STRONG" if memory_bullish_count >= 2 else "WEAK_DRIFT"
+
+    # 3. 输出多 Tab 结构化本地 Excel
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
     excel_filename = f"QQQ_VPA_Forensic_{timestamp_str}.xlsx"
     
@@ -263,14 +339,22 @@ def generate_9pm_report():
         df_dip.to_excel(writer, sheet_name="Dip_To_Swing_20Pct", index=False)
     
     print(f"\n[+] 战役 Excel 生成成功: {excel_filename}")
+
+    # 4. 自动推送数据至 Google Sheets
+    push_to_google_sheets(df_qqq_summary, df_breadth, df_dip, htf_bias, mag7_ratio_str, mem_pulse_str)
     
-    # 4. 打印给 Gem 的真实 RAW DATA
+    # 5. 打印给 Gem 的真实 RAW DATA PAYLOAD
     print("\n" + "="*80)
     print("      可以直接复制发给 Gem 的 9:00 PM RAW DATA PAYLOAD")
     print("="*80)
     payload_text = {
         "QQQ_Coordinates": df_qqq_summary.to_dict(orient="records")[0],
-        "Breadth_Summary": df_breadth.to_dict(orient="records"),
+        "HTF_Bias": htf_bias,
+        "Breadth_Summary": {
+            "Mag7_Bullish_Count": mag7_ratio_str,
+            "Memory_Pulse": mem_pulse_str,
+            "Details": df_breadth.to_dict(orient="records")
+        },
         "Dip_Buys_Triggered": df_dip[df_dip['Status'] == 'IN_BUY_ZONE'].to_dict(orient="records")
     }
     print(json.dumps(payload_text, indent=2, ensure_ascii=False))
