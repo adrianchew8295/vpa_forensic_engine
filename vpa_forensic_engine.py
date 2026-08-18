@@ -24,7 +24,7 @@ HEADERS = {
 }
 
 # ==============================================================================
-# 1. 物理量价特征工程 (VPA FORENSIC ENGINE)
+# 1. 物理量价特征工程 (VPA FORENSIC ENGINE & ATR)
 # ==============================================================================
 def classify_vpa(open_p, high_p, low_p, close_p, volume, avg_volume):
     spread = max(high_p - low_p, 0.0001)
@@ -55,13 +55,14 @@ def classify_vpa(open_p, high_p, low_p, close_p, volume, avg_volume):
     return "NORMAL", rvol, close_pos, upper_wick_ratio, lower_wick_ratio
 
 def calculate_volume_profile(df_intraday, price_col='close', vol_col='volume', bins=30):
+    """计算 Volume Profile: POC 与 70% 价值区 (VAH / VAL)"""
     if df_intraday.empty or df_intraday[vol_col].sum() == 0:
         return None, None, None
     
     min_p = df_intraday['low'].min()
     max_p = df_intraday['high'].max()
     if min_p == max_p:
-        return min_p, max_p, min_p
+        return round(min_p, 2), round(max_p, 2), round(min_p, 2)
     
     price_bins = np.linspace(min_p, max_p, bins)
     vol_profile = np.zeros(bins - 1)
@@ -98,8 +99,20 @@ def calculate_volume_profile(df_intraday, price_col='close', vol_col='volume', b
     vah = price_bins[high_idx + 1]
     return round(poc, 2), round(vah, 2), round(val, 2)
 
+def calculate_atr(df, period=14):
+    """计算真实波幅 ATR"""
+    if len(df) < period + 1:
+        return 1.5  # 默认兜底波幅
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    atr = true_range.rolling(period).mean().iloc[-1]
+    return round(float(atr), 2) if not np.isnan(atr) else 1.5
+
 # ==============================================================================
-# 2. Tiingo API 数据提取管道 (REAL-TIME & INTRADAY)
+# 2. Tiingo API 数据提取管道 (REAL-TIME & MULTI-DAY INTRADAY)
 # ==============================================================================
 def fetch_tiingo_daily(ticker, days=252):
     """获取 252 交易日（1 年）数据以保证 52 周最高点精度"""
@@ -129,19 +142,19 @@ def fetch_tiingo_realtime_quote(ticker):
         print(f"[-] Realtime quote notice for {ticker}: {e}")
     return {}
 
-def fetch_tiingo_intraday_premarket(ticker):
-    """使用 5 分钟级别抓取今日盘前真实分时"""
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    url = f"https://api.tiingo.com/iex/{ticker}/prices?startDate={today_str}&resampleFreq=5min&columns=date,open,high,low,close,volume&token={TIINGO_API_KEY}"
+def fetch_tiingo_intraday_multi_days(ticker, days=4):
+    """抓取最近多日 5 分钟级别分时（分离昨日 RTH 与今日盘前）"""
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    url = f"https://api.tiingo.com/iex/{ticker}/prices?startDate={start_date}&resampleFreq=5min&columns=date,open,high,low,close,volume&token={TIINGO_API_KEY}"
     try:
-        res = requests.get(url, headers=HEADERS, timeout=10)
+        res = requests.get(url, headers=HEADERS, timeout=12)
         if res.status_code == 200:
             df = pd.DataFrame(res.json())
             if not df.empty:
                 df['date'] = pd.to_datetime(df['date'])
-                return df
+                return df.sort_values('date').reset_index(drop=True)
     except Exception as e:
-        print(f"[-] Intraday fetch notice for {ticker}: {e}")
+        print(f"[-] Multi-day Intraday fetch notice for {ticker}: {e}")
     return pd.DataFrame()
 
 # ==============================================================================
@@ -156,22 +169,25 @@ def push_to_google_sheets(df_qqq, df_breadth, df_dip, bias, mag7_ratio, mem_puls
     today_str = datetime.now().strftime("%Y-%m-%d")
     qqq_row = df_qqq.iloc[0].to_dict()
 
-    # 1. Today_War_Room 载荷
+    # 1. Today_War_Room 载荷 (新增昨日 RTH 与 AMT 状态字段)
     war_room_headers = [
-        "Date", "Symbol", "HTF_Bias", "4H_Major_Res", "PMH", 
-        "Premarket_POC", "PML", "4H_Major_Sup", "Hard_SL", "No_Trade_Zone", "Live_Price"
+        "Date", "Symbol", "HTF_Bias", "AMT_Open_Status", "4H_Major_Res", "PMH", 
+        "Premarket_POC", "PML", "Yesterday_POC", "Yesterday_VAH", "Yesterday_VAL",
+        "4H_Major_Sup", "Hard_SL", "ATR_SL", "Live_Price"
     ]
     war_room_row = [
-        today_str, "QQQ", bias, qqq_row["4H_Major_Res"], qqq_row["PMH"],
-        qqq_row["Premarket_POC"], qqq_row["PML"], qqq_row["4H_Major_Sup"],
-        qqq_row["Hard_SL"], qqq_row["No_Trade_Zone"], qqq_row["Last_Premarket_Price"]
+        today_str, "QQQ", bias, qqq_row.get("AMT_Open_Status", "NORMAL"),
+        qqq_row["4H_Major_Res"], qqq_row["PMH"], qqq_row["Premarket_POC"], 
+        qqq_row["PML"], qqq_row["Yesterday_POC"], qqq_row["Yesterday_VAH"], 
+        qqq_row["Yesterday_VAL"], qqq_row["4H_Major_Sup"], qqq_row["Hard_SL"], 
+        qqq_row.get("ATR_SL", qqq_row["Hard_SL"]), qqq_row["Last_Premarket_Price"]
     ]
 
     # 2. Daily_History 追加行载荷
     history_row = [
         today_str, "QQQ", bias, qqq_row["Premarket_POC"], qqq_row["PMH"],
-        qqq_row["PML"], qqq_row["4H_Major_Res"], qqq_row["4H_Major_Sup"],
-        mag7_ratio, mem_pulse
+        qqq_row["PML"], qqq_row["Yesterday_POC"], qqq_row["Yesterday_VAH"],
+        qqq_row["Yesterday_VAL"], mag7_ratio, mem_pulse
     ]
 
     # 3. Market_Breadth_12 载荷
@@ -194,7 +210,7 @@ def push_to_google_sheets(df_qqq, df_breadth, df_dip, bias, mag7_ratio, mem_puls
         if res.status_code == 200 and "SUCCESS" in res.text:
             print("🚀 Google Sheets 4 大工作表已全部全自动同步更新！")
         else:
-            print(f"[-] Google Sheet 同步响应异常: {res.text}")
+            print(f"[-] Google Sheet 同步响应: {res.text}")
     except Exception as e:
         print(f"[-] Google Sheet 同步请求失败: {e}")
 
@@ -202,15 +218,15 @@ def push_to_google_sheets(df_qqq, df_breadth, df_dip, bias, mag7_ratio, mem_puls
 # 4. 核心计算与数据聚合 (PIPELINE AGGREGATION)
 # ==============================================================================
 def generate_9pm_report():
-    print("[*] 正在启动 9:00 PM 实时量价法医计算引擎...")
+    print("[*] 正在启动 9:00 PM 实时量价法医计算引擎 (含昨日 RTH 价值区与 AMT 拍卖状态)...")
     
-    # 1. QQQ 宏观与真实盘前计算
+    # 1. QQQ 宏观、分时与昨日 RTH 计算
     qqq_daily = fetch_tiingo_daily(TARGET_INDEX, days=252)
-    qqq_intra = fetch_tiingo_intraday_premarket(TARGET_INDEX)
+    qqq_intra_all = fetch_tiingo_intraday_multi_days(TARGET_INDEX, days=5)
     qqq_quote = fetch_tiingo_realtime_quote(TARGET_INDEX)
     
     # 宏观价格
-    res_4h = round(qqq_daily['high'].max(), 2) if not qqq_daily.empty else 745.45
+    res_4h = round(qqq_daily['high'].max(), 2) if not qqq_daily.empty else 748.65
     sup_4h = round(qqq_daily['low'].tail(30).min(), 2) if not qqq_daily.empty else 661.14
     yesterday_close = round(qqq_daily['close'].iloc[-1], 2) if not qqq_daily.empty else 732.07
     
@@ -218,19 +234,45 @@ def generate_9pm_report():
     live_price = qqq_quote.get('tngoLast') or qqq_quote.get('last') or yesterday_close
     live_price = round(float(live_price), 2)
     
-    if not qqq_intra.empty and len(qqq_intra) >= 2:
-        pmh = round(qqq_intra['high'].max(), 2)
-        pml = round(qqq_intra['low'].min(), 2)
-        poc, vah, val = calculate_volume_profile(qqq_intra)
-    else:
-        pmh = round(max(live_price, yesterday_close) * 1.003, 2)
-        pml = round(min(live_price, yesterday_close) * 0.997, 2)
-        poc = round((pmh + pml) / 2.0, 2)
-        vah = pmh
-        val = pml
+    # 区分“今日盘前”与“昨日 RTH”
+    y_poc, y_vah, y_val = yesterday_close, round(yesterday_close * 1.004, 2), round(yesterday_close * 0.996, 2)
+    pmh, pml, poc, vah, val = round(live_price * 1.003, 2), round(live_price * 0.997, 2), live_price, live_price, live_price
+    atr_val = 1.50
+    
+    if not qqq_intra_all.empty:
+        qqq_intra_all['date_only'] = qqq_intra_all['date'].dt.date
+        unique_dates = sorted(qqq_intra_all['date_only'].unique())
+        
+        # 今日盘前 (最新的一天)
+        today_date = unique_dates[-1]
+        today_df = qqq_intra_all[qqq_intra_all['date_only'] == today_date]
+        
+        if len(today_df) >= 2:
+            pmh = round(today_df['high'].max(), 2)
+            pml = round(today_df['low'].min(), 2)
+            poc, vah, val = calculate_volume_profile(today_df)
+        
+        # 提取昨日 RTH 价值区 (倒数第二天)
+        if len(unique_dates) >= 2:
+            yesterday_date = unique_dates[-2]
+            yesterday_df = qqq_intra_all[qqq_intra_all['date_only'] == yesterday_date]
+            if not yesterday_df.empty:
+                y_poc, y_vah, y_val = calculate_volume_profile(yesterday_df)
+        
+        # 计算 5m 真实波动率 ATR
+        atr_val = calculate_atr(qqq_intra_all, period=14)
 
-    # 条件框架衍生指标
+    # 拍卖市场理论 (AMT) 开盘状态判定
+    if live_price > y_vah:
+        amt_status = "ABOVE_Y_VAH (BULLISH_IMBALANCE)"
+    elif live_price < y_val:
+        amt_status = "BELOW_Y_VAL (BEARISH_IMBALANCE)"
+    else:
+        amt_status = "INSIDE_Y_VALUE (RANGE_BALANCE_CHOP_RISK)"
+
+    # 止损衍生指标 (硬止损 vs ATR 动态止损)
     hard_sl = round(pml * 0.997, 2)
+    atr_sl = round(pml - (0.25 * atr_val), 2)
     no_trade_zone = f"{round(pml + (poc - pml)*0.3, 2)} - {round(poc + (pmh - poc)*0.3, 2)}"
 
     df_qqq_summary = pd.DataFrame([{
@@ -242,7 +284,13 @@ def generate_9pm_report():
         "Premarket_POC": poc,
         "VAH": vah,
         "VAL": val,
+        "Yesterday_POC": y_poc,
+        "Yesterday_VAH": y_vah,
+        "Yesterday_VAL": y_val,
+        "AMT_Open_Status": amt_status,
         "Hard_SL": hard_sl,
+        "ATR_5m": atr_val,
+        "ATR_SL": atr_sl,
         "No_Trade_Zone": no_trade_zone,
         "Yesterday_Close": yesterday_close,
         "Last_Premarket_Price": live_price,
@@ -257,7 +305,7 @@ def generate_9pm_report():
     
     for ticker in ALL_TICKERS:
         daily_df = fetch_tiingo_daily(ticker, days=252)
-        intra_df = fetch_tiingo_intraday_premarket(ticker)
+        intra_df = fetch_tiingo_intraday_multi_days(ticker, days=2)
         quote = fetch_tiingo_realtime_quote(ticker)
         
         peak_high = round(daily_df['high'].max(), 2) if not daily_df.empty else 100.0
@@ -350,6 +398,7 @@ def generate_9pm_report():
     payload_text = {
         "QQQ_Coordinates": df_qqq_summary.to_dict(orient="records")[0],
         "HTF_Bias": htf_bias,
+        "AMT_Open_Status": amt_status,
         "Breadth_Summary": {
             "Mag7_Bullish_Count": mag7_ratio_str,
             "Memory_Pulse": mem_pulse_str,
